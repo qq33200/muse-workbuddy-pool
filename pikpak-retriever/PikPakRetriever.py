@@ -51,6 +51,40 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 LINK_RE = re.compile(r"https?://mypikpak\.com/s/[A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-]+)?")
 
+# ---------------------------------------------------------------- 本地代理探测
+# 有些网络环境（如中国大陆）直连连不通 DuckDuckGo / Google，但本机翻墙客户端
+# （Clash / FlClash / v2ray 等）会在常见端口开一个本地 HTTP 代理。这里启动时
+# 探测这些端口，找到能用的就走它，找不到就保持直连，不影响原本能用的环境。
+LOCAL_PROXY_PORTS = [7890, 7897, 10809, 1080, 2080, 10808]
+_PROXY_TEST_URL = "https://www.bing.com"
+
+
+def _detect_proxy():
+    """返回一个可用的本地代理 dict（供 ProxyHandler 用），没有则 None。
+    只测本地端口、超时很短，探测失败不会有明显延迟。"""
+    for port in LOCAL_PROXY_PORTS:
+        proxy = {"http": "http://127.0.0.1:%d" % port,
+                 "https": "http://127.0.0.1:%d" % port}
+        try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler(proxy))
+            req = urllib.request.Request(_PROXY_TEST_URL,
+                                         headers={"User-Agent": UA})
+            with opener.open(req, timeout=3) as resp:
+                if resp.status in (200, 302):
+                    return proxy
+        except Exception:
+            continue
+    return None
+
+
+_LOCAL_PROXY = _detect_proxy()
+if _LOCAL_PROXY:
+    _OPENER = urllib.request.build_opener(
+        urllib.request.ProxyHandler(_LOCAL_PROXY))
+else:
+    _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 # ---------------------------------------------------------------- 基础工具
 
@@ -64,7 +98,7 @@ def fetch_url(url, timeout=20, retries=1):
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             })
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _OPENER.open(req, timeout=timeout) as resp:
                 raw = resp.read()
                 text = raw.decode("utf-8", "ignore")
                 return resp.status, text
