@@ -42,7 +42,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from queue import Queue
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 CSV_COLUMNS = ["序号", "资源名称", "分类", "PikPak分享链接", "搜索关键词"]
 CATEGORIES = ["未分类", "电影", "电视剧", "动漫", "综艺", "纪录片", "音乐",
               "软件", "资料", "小说", "其他"]
@@ -50,7 +50,38 @@ CATEGORIES = ["未分类", "电影", "电视剧", "动漫", "综艺", "纪录片
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 LINK_RE = re.compile(r"https?://mypikpak\.com/s/[A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-]+)?")
-DDG_RETRIES = 4  # 交错 202 限流时，同一页最多重试几次
+DDG_RETRIES = 4  # DDG 是随机限流（约一半请求被拦），换 UA 试 4 次命中率已够
+DDG_TIMEOUT = 8  # DDG 单次请求超时：验证页秒回，长超时只会让用户干等
+
+# DDG 的反爬不是硬封 IP，而是按指纹随机拦。实测同 IP 下 Safari UA 命中率明显高于
+# Chrome/Firefox，且同一 UA 连续请求会 202/200 交替。所以每个来源请求轮换 UA 重试。
+UA_POOL = [
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+     "(KHTML, like Gecko) Version/17.0 Safari/605.1.15"),
+    ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+     "(KHTML, like Gecko) Version/16.6 Safari/605.1.15"),
+    ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"),
+    ("Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 "
+     "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"),
+    UA,
+]
+_UA_CURSOR = {"i": 0}
+
+
+def _next_ua():
+    """轮换 UA。每取一次换下一个，避免连续同指纹被拦。"""
+    i = _UA_CURSOR["i"] % len(UA_POOL)
+    _UA_CURSOR["i"] += 1
+    return UA_POOL[i], i
+
+
+def _is_ddg_challenge(text):
+    """DDG 的 202 反爬页：要求选图片验证。命中就说明出口 IP 被判成机器人，
+    继续重试没有意义，应尽快告诉用户换代理节点。"""
+    t = (text or "").lower()
+    return ("challenge" in t or "select all squares" in t
+            or "bots use duckduckgo" in t or "anomaly" in t)
 
 # ---------------------------------------------------------------- 本地代理探测
 # 有些网络环境（如中国大陆）直连连不通 DuckDuckGo / Google，但本机翻墙客户端
@@ -89,13 +120,14 @@ else:
 
 # ---------------------------------------------------------------- 基础工具
 
-def fetch_url(url, timeout=20, retries=1):
-    """直接 GET 一个 URL，返回 (状态码, 文本)。失败返回 (0, '')。"""
+def fetch_url(url, timeout=20, retries=1, ua=None):
+    """直接 GET 一个 URL，返回 (状态码, 文本)。失败返回 (0, '')。
+    ua 可覆盖默认 UA（DDG 需要轮换指纹）。"""
     last_err = None
     for attempt in range(retries + 1):
         try:
             req = urllib.request.Request(url, headers={
-                "User-Agent": UA,
+                "User-Agent": ua or UA,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             })
@@ -325,25 +357,22 @@ def search_source(name, keyword, page=1, ddg_offset=None):
         # 绝不能因为一次 202 就判定翻到底。
         s = ddg_offset if ddg_offset is not None else (page - 1) * 10
         status, text, items = 0, "", []
-        tried = set()
+        challenged = False
         for attempt in range(DDG_RETRIES):
-            if s in tried:
-                # 同一偏移重试：DDG 的 202 常是随机的，稍等再试同一页
-                time.sleep(1.2)
             url = "https://html.duckduckgo.com/html/?q=%s&s=%d" % (q, s)
-            status, text = fetch_url(url)
-            tried.add(s)
+            ua, _ = _next_ua()  # 每次换一个指纹，绕开随机限流
+            status, text = fetch_url(url, timeout=DDG_TIMEOUT, ua=ua)
+            if _is_ddg_challenge(text):
+                # 随机限流：这个指纹被拦，换 UA 再来；连试几次都不行才放弃
+                challenged = True
+                time.sleep(0.5 + attempt * 0.3)
+                continue
+            challenged = False
             items = parse_ddg_html(text)
             if items:
                 break
-            # 空页：可能 202 限流，也可能这一偏移确实没结果。交替试相邻的
-            # 偏移（s-10 / s+10），避免因单个坏页误判到底。
-            step = 10
-            cand = [s + step, max(0, s - step)]
-            nxt_s = next((x for x in cand if x not in tried), None)
-            if nxt_s is None:
-                break
-            s = nxt_s
+            # 空页但不是验证页：试下一个偏移（可能是该偏移本身没结果）
+            s += 10
         # 解析下一页偏移：页面里 name="s" 的 value；没有则视为到底
         next_off = None
         m = re.search(r'name="s"[^>]*value="(\d+)"', text or "")
@@ -367,7 +396,10 @@ def search_source(name, keyword, page=1, ddg_offset=None):
                 return items, ("DuckDuckGo：%d 条（%d 条无标题，已保存 ddg_debug.html）"
                                % (len(items), n_no_title)), next_off
             return items, "DuckDuckGo：%d 条" % len(items), next_off
-        return items, "DuckDuckGo：连续 %d 次无结果（可能被限流，等一会儿再试）" % DDG_RETRIES, next_off
+        if challenged:
+            return items, ("DuckDuckGo：被人机验证拦截（出口 IP 被判定为机器人）"
+                           "——请换代理节点后重试"), None
+        return items, "DuckDuckGo：本批无更多结果", None
     if name == "Google":
         url = "https://www.google.com/search?q=%s&num=20" % q
         status, text = fetch_url(url)
@@ -421,8 +453,14 @@ def search_batch(keyword, sources, state, target=None):
             state["page"][name] = page + 1
             if name == "DuckDuckGo" and next_off is not None:
                 state["ddg_next"] = next_off
-            statuses[name] = st
+            # 被随机限流：本批不再向该来源要更多（继续请求只会延长等待），
+            # 下一批点“继续加载”会重新试。
+            if "人机验证" in (st or ""):
+                exhausted.add(name)
             fresh = [it for it in items if it["link"] not in state["seen"]]
+            if fresh and "人机验证" in (st or ""):
+                st = "%s：本页 %d 条（后续页被限流，可点继续加载再试）" % (name, len(fresh))
+            statuses[name] = st
             if fresh:
                 empty_streak[name] = 0
                 for it in fresh:
@@ -438,6 +476,9 @@ def search_batch(keyword, sources, state, target=None):
                 if empty_streak[name] >= limit:
                     exhausted.add(name)
             time.sleep(0.3)  # 来源之间停一下，别被当成刷请求
+        # 所有来源都已不可用（到底或被验证拦截）→ 立即结束，不空转
+        if sources and all(n in exhausted for n in sources):
+            break
         if progressed:
             idle_rounds = 0
         else:
@@ -616,9 +657,19 @@ def gui_main():
                                    "  新增 %d 条（重复 %d，已排除 %d）" % (n, n_dup, n_ex))
                 elif kind == "done":
                     state["searching"] = False
-                    status_var.set("%s；共 %d 条" % (payload, len(state["items"])))
+                    msg = payload.get("msg", "") if isinstance(payload, dict) else payload
+                    challenged = payload.get("challenged", False) if isinstance(payload, dict) else False
+                    status_var.set("%s；共 %d 条" % (msg, len(state["items"])))
                     if state.get("last_added", 1) == 0:
-                        messagebox.showinfo("没有更多了", "已经翻到底了，没有更多结果了。")
+                        if challenged:
+                            messagebox.showwarning(
+                                "搜索被拦截",
+                                "DuckDuckGo 要求人机验证，说明当前代理的出口 IP "
+                                "被判定为机器人。\n\n"
+                                "解决办法：换一个代理节点（换出口 IP）后重试。\n"
+                                "在 FlClash 里切换到非 WARP 的节点，再点「聚合搜索」。")
+                        else:
+                            messagebox.showinfo("没有更多了", "已经翻到底了，没有更多结果了。")
         except Exception:
             pass
         root.after(200, poll_queue)
@@ -630,8 +681,11 @@ def gui_main():
         for name in sources:
             q.put(("status", statuses.get(name, "")))
         q.put(("items", items))
-        q.put(("done", "本批完成：%s" % (
-            "；".join(statuses.get(n, "") for n in sources),)))
+        challenged = any("人机验证" in (statuses.get(n) or "") for n in sources)
+        q.put(("done", {
+            "msg": "本批完成：%s" % "；".join(statuses.get(n, "") for n in sources),
+            "challenged": challenged,
+        }))
 
     def do_search(more=False):
         keyword = kw_var.get().strip()
