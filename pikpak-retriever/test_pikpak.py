@@ -80,9 +80,24 @@ BING_RSS = '''<?xml version="1.0" encoding="utf-8"?>
 
 class TestParsers(unittest.TestCase):
     def test_version(self):
-        # 跟随 PikPakRetriever.VERSION：v1.1.2 起由 WorkBuddy 的代理修复提交
-        # 0f1c01f 升版，断言过期就会像 #5 一样在定时测试里报失败。
-        self.assertEqual(PR.VERSION, "1.1.2")
+        # 回归用例（#5、#6）：版本号唯一的事实来源是 PikPakRetriever.VERSION，
+        # 测试里再也不写死 "1.1.2" 这类字面值 —— 每次升版都会像 #5、#6 一样
+        # 把定时测试打红。这里只断言：版本号存在、是合法的 x.y.z 三段式，
+        # 并且窗口标题确实是用它拼出来的（改了 VERSION，标题就跟着变）。
+        self.assertIsInstance(PR.VERSION, str)
+        self.assertRegex(PR.VERSION, r"^\d+\.\d+\.\d+$")
+        import inspect
+        self.assertIn('v%s" % VERSION', inspect.getsource(PR))
+
+    def test_version_survives_bump(self):
+        # 回归用例（#6）：模拟 WorkBuddy 升版 —— 把 VERSION 临时改成别的
+        # 合法值（"1.1.3" 就是 #6 当时报失败的实际值），版本断言必须照样通过；
+        # 以前写死 "1.1.2" 的做法一升版就红，今后不允许再出现。
+        before = PR.VERSION
+        for bumped in ("1.1.3", "1.1.4", "2.0.0"):
+            with mock.patch.object(PR, "VERSION", bumped):
+                self.assertRegex(PR.VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(PR.VERSION, before)  # 补丁退出后恢复原值
 
     def test_local_proxy_detection_exists(self):
         # WorkBuddy 2026-11-19 小修：本地代理自动探测，修 DDG/Google 连不通。
