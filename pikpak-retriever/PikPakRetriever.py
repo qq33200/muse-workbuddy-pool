@@ -42,7 +42,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from queue import Queue
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 CSV_COLUMNS = ["序号", "资源名称", "分类", "PikPak分享链接", "搜索关键词"]
 CATEGORIES = ["未分类", "电影", "电视剧", "动漫", "综艺", "纪录片", "音乐",
               "软件", "资料", "小说", "其他"]
@@ -50,6 +50,7 @@ CATEGORIES = ["未分类", "电影", "电视剧", "动漫", "综艺", "纪录片
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 LINK_RE = re.compile(r"https?://mypikpak\.com/s/[A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-]+)?")
+DDG_RETRIES = 4  # 交错 202 限流时，同一页最多重试几次
 
 # ---------------------------------------------------------------- 本地代理探测
 # 有些网络环境（如中国大陆）直连连不通 DuckDuckGo / Google，但本机翻墙客户端
@@ -295,8 +296,11 @@ def parse_google_html(text):
 
 # ---------------------------------------------------------------- 搜索
 
-def search_source(name, keyword, page=1):
-    """搜一个来源。返回 (条目列表, 状态说明)。page 从 1 开始，每页约 20 条。"""
+def search_source(name, keyword, page=1, ddg_offset=None):
+    """搜一个来源。返回 (条目列表, 状态说明, 下一页偏移)。
+    page 从 1 开始。ddg_offset 是 DuckDuckGo 的真实翻页偏移（由上一页解析得到），
+    为 None 时按 page 推算。第三项只对 DDG 有意义：页面里 name="s" 的 value，
+    拿不到则为 None（表示没有更多页）。"""
     q = urllib.parse.quote("site:mypikpak.com/s/ " + keyword)
     first = (page - 1) * 20 + 1
     if name == "Bing RSS":
@@ -304,29 +308,50 @@ def search_source(name, keyword, page=1):
                % (q, first))
         status, text = fetch_url(url)
         if status != 200:
-            return [], "Bing RSS：请求失败（HTTP %s），稍后重试" % status
+            return [], "Bing RSS：请求失败（HTTP %s），稍后重试" % status, None
         items = parse_bing_rss(text)
-        return items, ("Bing RSS：%d 条" % len(items)) if items else "Bing RSS：无结果"
+        return items, (("Bing RSS：%d 条" % len(items)) if items else "Bing RSS：无结果"), None
     if name == "Bing 网页":
         url = ("https://www.bing.com/search?q=%s&count=20&first=%d"
                % (q, first))
         status, text = fetch_url(url)
         if status != 200:
-            return [], "Bing 网页：请求失败（HTTP %s），稍后重试" % status
+            return [], "Bing 网页：请求失败（HTTP %s），稍后重试" % status, None
         items = parse_bing_html(text)
-        return items, ("Bing 网页：%d 条" % len(items)) if items else "Bing 网页：无结果（Bing 结果常需脚本加载，RSS 已覆盖 Bing）"
+        return items, (("Bing 网页：%d 条" % len(items)) if items else "Bing 网页：无结果（Bing 结果常需脚本加载，RSS 已覆盖 Bing）"), None
     if name == "DuckDuckGo":
-        # html 版每页约 30 条，用 s 做翻页偏移；202 常是机器人验证页，没有真结果
-        url = ("https://html.duckduckgo.com/html/?q=%s&s=%d"
-               % (q, (page - 1) * 30))
-        status, text = fetch_url(url)
-        if status not in (200, 202):
-            return [], "DuckDuckGo：请求失败（HTTP %s），稍后重试" % status
-        items = parse_ddg_html(text)
+        # html 版每页 10 条，翻页偏移 s 由页面里 <input name="s" value="N"> 给出。
+        # DDG 会交错返回 202 机器人验证页（并非到底），所以空页要重试并跳过，
+        # 绝不能因为一次 202 就判定翻到底。
+        s = ddg_offset if ddg_offset is not None else (page - 1) * 10
+        status, text, items = 0, "", []
+        tried = set()
+        for attempt in range(DDG_RETRIES):
+            if s in tried:
+                # 同一偏移重试：DDG 的 202 常是随机的，稍等再试同一页
+                time.sleep(1.2)
+            url = "https://html.duckduckgo.com/html/?q=%s&s=%d" % (q, s)
+            status, text = fetch_url(url)
+            tried.add(s)
+            items = parse_ddg_html(text)
+            if items:
+                break
+            # 空页：可能 202 限流，也可能这一偏移确实没结果。交替试相邻的
+            # 偏移（s-10 / s+10），避免因单个坏页误判到底。
+            step = 10
+            cand = [s + step, max(0, s - step)]
+            nxt_s = next((x for x in cand if x not in tried), None)
+            if nxt_s is None:
+                break
+            s = nxt_s
+        # 解析下一页偏移：页面里 name="s" 的 value；没有则视为到底
+        next_off = None
+        m = re.search(r'name="s"[^>]*value="(\d+)"', text or "")
+        if m:
+            next_off = int(m.group(1))
         if not items:
             # html 版没出结果时，试 lite 版（结构更简单，有时能绕开）
-            status2, text2 = fetch_url(
-                "https://lite.duckduckgo.com/lite/?q=" + q)
+            status2, text2 = fetch_url("https://lite.duckduckgo.com/lite/?q=" + q)
             if status2 in (200, 202):
                 items = parse_ddg_lite(text2)
         if items:
@@ -340,19 +365,19 @@ def search_source(name, keyword, page=1):
                 except Exception:
                     pass
                 return items, ("DuckDuckGo：%d 条（%d 条无标题，已保存 ddg_debug.html）"
-                               % (len(items), n_no_title))
-            return items, "DuckDuckGo：%d 条" % len(items)
-        return items, "DuckDuckGo：无结果（可能被限流，等一会儿再试）"
+                               % (len(items), n_no_title)), next_off
+            return items, "DuckDuckGo：%d 条" % len(items), next_off
+        return items, "DuckDuckGo：连续 %d 次无结果（可能被限流，等一会儿再试）" % DDG_RETRIES, next_off
     if name == "Google":
         url = "https://www.google.com/search?q=%s&num=20" % q
         status, text = fetch_url(url)
         if status == 429:
-            return [], "Google：被限流（429），等一会儿再试，不影响其他来源"
+            return [], "Google：被限流（429），等一会儿再试，不影响其他来源", None
         if status != 200:
-            return [], "Google：请求失败（HTTP %s），稍后重试" % status
+            return [], "Google：请求失败（HTTP %s），稍后重试" % status, None
         items = parse_google_html(text)
-        return items, ("Google：%d 条" % len(items)) if items else "Google：无结果"
-    return [], "未知来源"
+        return items, (("Google：%d 条" % len(items)) if items else "Google：无结果"), None
+    return [], "未知来源", None
 
 
 SOURCES = ["Bing RSS", "Bing 网页", "DuckDuckGo", "Google"]
@@ -366,25 +391,36 @@ def new_batch_state():
     """一批一批往下翻的状态：已见过的链接、每个来源翻到第几页。
     注意“翻到底”的判断只在一批之内有效：Bing RSS 这类来源有时会间歇性
     返回空，下一批（下一次点“继续加载”）会重新试，不会永久拉黑。"""
-    return {"seen": set(), "page": {}}
+    return {"seen": set(), "page": {}, "ddg_next": None}
 
 
-def search_batch(keyword, sources, state):
-    """抓一批新结果：各来源轮流往下翻页，直到攒够 BATCH_SIZE 条新结果，
-    或所有来源在本批内都翻到底（连续两页没有新结果）。返回 (新条目, {来源: 状态})。
-    没有上限——只要还有新结果，点“继续加载”就能一直往下翻。"""
+def search_batch(keyword, sources, state, target=None):
+    """抓一批新结果：各来源轮流往下翻页，直到攒够 target 条新结果，
+    或所有来源都真正翻到底。返回 (新条目, {来源: 状态})。
+
+    target 默认为 BATCH_SIZE（100）。不足 target 时不会提前报 0：
+    会继续翻页，直到来源确实没有更多（DDG 的 202 限流页会被跳过重试，
+    不当成到底）。用户点“继续加载”就是再抓一批。"""
+    if target is None:
+        target = BATCH_SIZE
     new_items, statuses = [], {}
     exhausted, empty_streak = set(), {}
     rounds = 0
-    while len(new_items) < BATCH_SIZE and rounds < MAX_ROUNDS_PER_BATCH:
+    idle_rounds = 0  # 连续几轮没有任何新结果
+    # 各来源容忍的空页次数：DDG 交错限流多，给足容错，避免误判到底
+    empty_limit = {"DuckDuckGo": 5}
+    while len(new_items) < target and rounds < MAX_ROUNDS_PER_BATCH:
         rounds += 1
         progressed = False
         for name in sources:
-            if name in exhausted or len(new_items) >= BATCH_SIZE:
+            if name in exhausted or len(new_items) >= target:
                 continue
             page = state["page"].get(name, 1)
-            items, st = search_source(name, keyword, page)
+            ddgoff = state.get("ddg_next") if name == "DuckDuckGo" else None
+            items, st, next_off = search_source(name, keyword, page, ddgoff)
             state["page"][name] = page + 1
+            if name == "DuckDuckGo" and next_off is not None:
+                state["ddg_next"] = next_off
             statuses[name] = st
             fresh = [it for it in items if it["link"] not in state["seen"]]
             if fresh:
@@ -398,11 +434,17 @@ def search_batch(keyword, sources, state):
                 progressed = True
             else:
                 empty_streak[name] = empty_streak.get(name, 0) + 1
-                if empty_streak[name] >= 2:
+                limit = empty_limit.get(name, 2)
+                if empty_streak[name] >= limit:
                     exhausted.add(name)
             time.sleep(0.3)  # 来源之间停一下，别被当成刷请求
-        if not progressed:
-            break
+        if progressed:
+            idle_rounds = 0
+        else:
+            idle_rounds += 1
+            # 连续 3 轮完全没进展才认定到底，给限流恢复的时间
+            if idle_rounds >= 3:
+                break
     return new_items, statuses
 
 
