@@ -80,7 +80,9 @@ BING_RSS = '''<?xml version="1.0" encoding="utf-8"?>
 
 class TestParsers(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(PR.VERSION, "1.1.1")
+        # 跟随 PikPakRetriever.VERSION：v1.1.2 起由 WorkBuddy 的代理修复提交
+        # 0f1c01f 升版，断言过期就会像 #5 一样在定时测试里报失败。
+        self.assertEqual(PR.VERSION, "1.1.2")
 
     def test_local_proxy_detection_exists(self):
         # WorkBuddy 2026-11-19 小修：本地代理自动探测，修 DDG/Google 连不通。
@@ -169,14 +171,17 @@ class TestParsers(unittest.TestCase):
         # 用假来源验证批量逻辑：按页取整，第一批抓满 100 条新结果就停，
         # 之后再翻两页没新结果就到底（search_batch 按页取整，会略超 100，
         # 所以这里用 60+40 正好 100 条来测）
-        def fake_search(name, keyword, page=1):
+        # v1.1.2：search_source 签名改为 (name, keyword, page=1, ddg_offset=None)，
+        # 返回 3 元组 (items, status, next_off)。mock 必须与之对齐，否则
+        # search_batch 调用时会报 TypeError（#5 的第二个失败）。
+        def fake_search(name, keyword, page=1, ddg_offset=None):
             if page == 1:
                 return ([{"title": "片%d" % i, "link": "https://mypikpak.com/s/F%d" % i}
-                         for i in range(60)], "ok")
+                         for i in range(60)], "ok", None)
             if page == 2:
                 return ([{"title": "片%d" % i, "link": "https://mypikpak.com/s/F%d" % i}
-                         for i in range(60, 100)], "ok")
-            return ([], "empty")
+                         for i in range(60, 100)], "ok", None)
+            return ([], "empty", None)
         with mock.patch.object(PR, "search_source", side_effect=fake_search):
             state = PR.new_batch_state()
             batch1, _ = PR.search_batch("测试", ["Fake"], state)
@@ -185,6 +190,30 @@ class TestParsers(unittest.TestCase):
             self.assertEqual(len({i["link"] for i in batch1}), 100)
             batch2, _ = PR.search_batch("测试", ["Fake"], state)
             self.assertEqual(len(batch2), 0)
+
+    def test_search_batch_ddg_offset_passthrough(self):
+        # 回归用例（#5）：search_batch 必须把上一页返回的 next_off 原样
+        # 作为 ddg_offset 传给下一页的 DDG 请求，并用它继续翻页、去重。
+        calls = []
+
+        def fake_ddg(name, keyword, page=1, ddg_offset=None):
+            calls.append(ddg_offset)
+            if page == 1:
+                return ([{"title": "片%d" % i, "link": "https://mypikpak.com/s/D%d" % i}
+                         for i in range(10)], "ok", 10)
+            if page == 2:
+                return ([{"title": "片%d" % i, "link": "https://mypikpak.com/s/D%d" % i}
+                         for i in range(10, 20)], "ok", 20)
+            return ([], "empty", None)
+
+        with mock.patch.object(PR, "search_source", side_effect=fake_ddg):
+            state = PR.new_batch_state()
+            batch, _ = PR.search_batch("测试", ["DuckDuckGo"], state, target=20)
+            self.assertEqual(len(batch), 20)
+            self.assertEqual(len({i["link"] for i in batch}), 20)
+            # 第一页 ddg_offset 为 None，第二页拿到上一页给的 next_off=10
+            self.assertEqual(calls[0], None)
+            self.assertIn(10, calls)
 
 
 def run_live(keyword):
